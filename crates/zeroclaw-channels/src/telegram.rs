@@ -22,6 +22,18 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 /// reporting the last success indefinitely.
 const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 
+/// Ceiling on one complete voice-drop notice attempt — both `sendMessage`
+/// requests (HTML and the plaintext fallback), their response-body reads, and
+/// the inter-chunk pauses.
+///
+/// The notice is sent from inside the update-processing path, before the
+/// permanent skip advances the offset, with a client that has no request
+/// timeout. Unbounded, a stalled request or response body would pin the offset
+/// and stop the whole listener — the health monitor can report that state but
+/// cannot cancel the wait. The drop is permanent either way, so on timeout the
+/// notice is abandoned, not retried.
+const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
+
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
@@ -655,6 +667,10 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Bound on one complete voice-drop notice attempt. Always
+    /// [`VOICE_DROP_NOTICE_TIMEOUT`] in production; tests shrink it so a
+    /// stalled-notice regression does not have to wait out the real ceiling.
+    voice_drop_notice_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,20 +779,27 @@ pub(crate) enum VoiceDropReason {
 impl VoiceDropReason {
     /// The sentence the sender sees. Vendor and engine diagnostics stay in the
     /// log: the sender gets the reason, never the internals.
+    ///
+    /// The wording is deliberately generic over voice notes and audio
+    /// uploads — this parser accepts both — and the advice has to survive the
+    /// causes it cannot distinguish: a permanent retrieval failure includes
+    /// files Telegram refuses as too big, where "send it again" would invite
+    /// the sender to hit the same wall twice.
     pub(crate) fn notice(self) -> String {
         match self {
             Self::TooLong { limit_secs } => format!(
-                "⚠️ Voice message skipped: it is longer than the {limit_secs}s limit. \
-                 Send a shorter recording or split it up."
+                "⚠️ Audio message skipped: it is longer than the {limit_secs}s limit. \
+                 Send a shorter recording or split it into parts."
             ),
             Self::FileUnavailable => {
-                "⚠️ Voice message skipped: the recording could not be retrieved from Telegram. \
-                 Please send it again."
+                "⚠️ Audio message skipped: the file could not be retrieved from Telegram — \
+                 it may be too large or no longer available. \
+                 Please try a smaller or shorter file."
                     .to_string()
             }
             Self::EmptyTranscript => {
-                "⚠️ Voice message skipped: nothing could be recognised in the recording. \
-                 Please try again, closer to the microphone."
+                "⚠️ Audio message skipped: nothing could be recognised in the recording. \
+                 Please try again with a clearer recording."
                     .to_string()
             }
         }
@@ -960,7 +983,17 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
         }
+    }
+
+    /// Shrink the voice-drop notice bound so a stalled-notice test does not
+    /// wait out the production ceiling. Test-only: the ceiling is not
+    /// operator-tunable — it exists to protect the listener, not to be tuned.
+    #[cfg(test)]
+    fn with_voice_drop_notice_timeout(mut self, timeout: Duration) -> Self {
+        self.voice_drop_notice_timeout = timeout;
+        self
     }
 
     /// Set the resolver used to resolve voice-chat peers live (no cached state).
@@ -2578,26 +2611,48 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Best effort by design: if the notice itself cannot be delivered the
     /// drop is still permanent, so the failure is logged and swallowed rather
     /// than turned into a retry of the original update.
+    ///
+    /// The whole attempt is bounded by [`VOICE_DROP_NOTICE_TIMEOUT`]. This
+    /// runs before the permanent skip lets the offset advance, and the
+    /// sending client has no request timeout of its own — an unbounded await
+    /// on a stalled request or response body would head-of-line block every
+    /// later update on this listener. Rejections that never touched the
+    /// network before (an over-duration recording) must not start doing so
+    /// just because they now say goodbye.
     async fn notify_voice_drop(
         &self,
         chat_id: &str,
         thread_id: Option<&str>,
         reason: VoiceDropReason,
     ) {
-        if let Err(e) = self
-            .send_text_chunks(&reason.notice(), chat_id, thread_id)
-            .await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
-                        "reason": format!("{reason:?}"),
-                    })),
-                "Failed to notify sender about skipped voice message"
-            );
+        let notice = reason.notice();
+        let attempt = self.send_text_chunks(&notice, chat_id, thread_id);
+        match tokio::time::timeout(self.voice_drop_notice_timeout, attempt).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Failed to notify sender about skipped voice message"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "timeout_secs": self.voice_drop_notice_timeout.as_secs_f64(),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Timed out notifying sender about skipped voice message; abandoning the notice"
+                );
+            }
         }
     }
 
@@ -8428,13 +8483,27 @@ mod tests {
         let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
         assert!(too_long.contains("900s limit"));
 
+        // The parser accepts audio uploads as well as voice notes, and a
+        // permanent retrieval failure includes files that are too big — the
+        // advice must fit both, not steer a music-file sender to a microphone
+        // or tell them to resend a file Telegram just refused.
+        let unavailable = VoiceDropReason::FileUnavailable.notice();
+        assert!(
+            unavailable.contains("smaller or shorter"),
+            "retrieval-failure advice must cover the too-big case: {unavailable}"
+        );
+
         for notice in [
             too_long,
-            VoiceDropReason::FileUnavailable.notice(),
+            unavailable,
             VoiceDropReason::EmptyTranscript.notice(),
         ] {
             assert!(
-                notice.starts_with("⚠️ Voice message skipped:"),
+                !notice.contains("microphone") && !notice.contains("voice"),
+                "wording must fit audio uploads, not just voice notes: {notice}"
+            );
+            assert!(
+                notice.starts_with("⚠️ Audio message skipped:"),
                 "every notice says what happened up front: {notice}"
             );
             assert!(
@@ -9725,6 +9794,85 @@ mod tests {
             uid_good + 1,
             LISTEN_HANG_GUARD,
             "past the permanently rejected update",
+        )
+        .await;
+
+        handle.abort();
+    }
+
+    /// The drop notice is sent from inside the update-processing path, before
+    /// the permanent skip advances the offset, with a client that has no
+    /// request timeout. A `sendMessage` that stalls must not turn one
+    /// dropped recording into a listener-wide stall: the notice attempt is
+    /// bounded, the skip stays permanent, and the update behind it is still
+    /// processed. All three drop reasons share `notify_voice_drop`, so the
+    /// over-duration path exercised here covers the bound for every reason.
+    #[tokio::test]
+    async fn listen_stalled_drop_notice_does_not_block_later_updates() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid_voice = 8_400;
+        let uid_good = 8_401;
+        let mut voice = telegram_voice_update(uid_voice, 90, 555, "alice", "voice_stall");
+        voice["message"]["voice"]["duration"] = serde_json::json!(600);
+        let good =
+            telegram_text_update(uid_good, 91, 555, "alice", "i am behind the stalled notice");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([voice, good])).await;
+        mount_telegram_get_updates(&mock_server, uid_good + 1, serde_json::json!([])).await;
+
+        // The notice request stalls far past the (shrunk) notice bound.
+        // Unbounded, this await would hold the offset at 0 and the text
+        // update behind it would never be delivered.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 10}}))
+                    .set_delay(Duration::from_secs(120)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_transcription(tc)
+            .with_api_base(mock_server.uri())
+            .with_voice_drop_notice_timeout(Duration::from_millis(250)),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update behind the stalled notice must still arrive.
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
+            .await
+            .expect("timed out: a stalled drop notice head-of-line blocked the listener")
+            .expect("channel closed before delivering the update behind the stalled notice");
+        assert_eq!(msg.content, "i am behind the stalled notice");
+
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid_good + 1,
+            LISTEN_HANG_GUARD,
+            "past the voice update whose notice stalled",
         )
         .await;
 
