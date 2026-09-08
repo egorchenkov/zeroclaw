@@ -777,8 +777,10 @@ pub(crate) enum VoiceDropReason {
 }
 
 impl VoiceDropReason {
-    /// The sentence the sender sees. Vendor and engine diagnostics stay in the
-    /// log: the sender gets the reason, never the internals.
+    /// The sentence the sender sees, resolved through the Fluent catalogue
+    /// like every other user-facing channel string. Vendor and engine
+    /// diagnostics stay in the log: the sender gets the reason, never the
+    /// internals.
     ///
     /// The wording is deliberately generic over voice notes and audio
     /// uploads — this parser accepts both — and the advice has to survive the
@@ -787,20 +789,18 @@ impl VoiceDropReason {
     /// the sender to hit the same wall twice.
     pub(crate) fn notice(self) -> String {
         match self {
-            Self::TooLong { limit_secs } => format!(
-                "⚠️ Audio message skipped: it is longer than the {limit_secs}s limit. \
-                 Send a shorter recording or split it into parts."
-            ),
+            Self::TooLong { limit_secs } => {
+                let limit_secs = limit_secs.to_string();
+                i18n::get_required_cli_string_with_args(
+                    "channel-telegram-voice-drop-too-long",
+                    &[("limit_secs", limit_secs.as_str())],
+                )
+            }
             Self::FileUnavailable => {
-                "⚠️ Audio message skipped: the file could not be retrieved from Telegram — \
-                 it may be too large or no longer available. \
-                 Please try a smaller or shorter file."
-                    .to_string()
+                i18n::get_required_cli_string("channel-telegram-voice-drop-file-unavailable")
             }
             Self::EmptyTranscript => {
-                "⚠️ Audio message skipped: nothing could be recognised in the recording. \
-                 Please try again with a clearer recording."
-                    .to_string()
+                i18n::get_required_cli_string("channel-telegram-voice-drop-empty-transcript")
             }
         }
     }
