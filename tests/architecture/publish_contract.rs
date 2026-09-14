@@ -14,6 +14,9 @@
 //!   which packages fine and then fails to compile from the tarball. Feature
 //!   gated ones are the dangerous case: `cargo publish --dry-run` verifies
 //!   default features only, so they pass preflight and ship broken
+//! * publish-order calculation hidden behind the dry-run return and fed the
+//!   full workspace metadata through argv, which exceeded Linux `ARG_MAX`
+//!   only after the irreversible job was approved
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -381,6 +384,28 @@ fn root_package_is_the_installable_crate() {
 }
 
 #[test]
+fn publish_order_is_streamed_and_exercised_by_preflight() {
+    let script = fs::read_to_string(repo_root().join("scripts/release/publish-crates.sh"))
+        .expect("read crates.io publisher");
+
+    assert!(
+        !script.contains("python3 - \"$META\""),
+        "cargo metadata must not be passed as one argv entry; the full workspace exceeds ARG_MAX"
+    );
+
+    let order = script
+        .find("ORDER=\"$(python3 - \"$VERSION\" 3<<<\"$META\"")
+        .expect("publisher streams metadata into its order helper");
+    let dry_run = script
+        .find("if [[ $EXECUTE -eq 0 ]]")
+        .expect("publisher has a tokenless dry-run branch");
+    assert!(
+        order < dry_run,
+        "tokenless preflight must compute publish order before returning"
+    );
+}
+
+#[test]
 fn release_set_is_exactly_the_root_closure_plus_companion_apps() {
     let crates = workspace_crates();
     let by_name: BTreeMap<&str, &Crate> = crates
@@ -666,6 +691,19 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
     "../../web/dist",
 )];
 
+fn slash_separated_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn repository_relative_paths_use_slash_separators() {
+    let windows_path = PathBuf::from(r"crates\zeroclaw-gateway\src\static_files.rs");
+    assert_eq!(
+        slash_separated_path(&windows_path),
+        "crates/zeroclaw-gateway/src/static_files.rs"
+    );
+}
+
 #[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
@@ -708,11 +746,11 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                         .to_path_buf()
                 };
                 let resolved = normalize(&base, &include.path);
-                let rel = source_path
-                    .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
+                let rel = slash_separated_path(
+                    source_path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&source_path),
+                );
                 let excepted = ESCAPE_EXCEPTIONS
                     .iter()
                     .any(|(f, p)| *f == rel && *p == include.path);
